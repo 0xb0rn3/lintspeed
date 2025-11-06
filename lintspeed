@@ -1,0 +1,262 @@
+#!/bin/bash
+
+INSTALL_FLAG="$HOME/.lintspeed_installed"
+SCRIPT_PATH="/usr/local/bin/lintspeed"
+
+if [ ! -f "$INSTALL_FLAG" ]; then
+    clear
+    echo "════════════════════════════════════════════════════════════"
+    echo "  LINTSPEED v1.0 - First Time Setup"
+    echo "  by 0xbv1 | 0xb0rn3"
+    echo "════════════════════════════════════════════════════════════"
+    echo ""
+    
+    if [ -f /etc/os-release ]; then
+        . /etc/os-release
+        echo "[*] Detected: $PRETTY_NAME"
+    else
+        echo "[*] Linux distribution detected"
+    fi
+    
+    echo "[*] Installing required dependencies..."
+    
+    if command -v apt-get &> /dev/null; then
+        sudo apt-get update -qq 2>/dev/null
+        sudo apt-get install -y python3 python3-pip 2>/dev/null
+    elif command -v dnf &> /dev/null; then
+        sudo dnf install -y python3 python3-pip 2>/dev/null
+    elif command -v yum &> /dev/null; then
+        sudo yum install -y python3 python3-pip 2>/dev/null
+    elif command -v pacman &> /dev/null; then
+        sudo pacman -Sy --noconfirm python python-pip 2>/dev/null
+    elif command -v zypper &> /dev/null; then
+        sudo zypper install -y python3 python3-pip 2>/dev/null
+    elif command -v apk &> /dev/null; then
+        sudo apk add --no-cache python3 py3-pip 2>/dev/null
+    fi
+    
+    echo "[*] Installing Python packages..."
+    pip3 install --break-system-packages requests 2>/dev/null || pip3 install requests 2>/dev/null
+    
+    touch "$INSTALL_FLAG"
+    
+    echo ""
+    echo "[?] Install lintspeed system-wide? (y/n)"
+    read -r response
+    if [[ "$response" =~ ^[Yy]$ ]]; then
+        if [ "$EUID" -ne 0 ]; then
+            echo "[*] Requesting sudo privileges for system-wide installation..."
+            sudo cp "$0" "$SCRIPT_PATH"
+            sudo chmod +x "$SCRIPT_PATH"
+            echo "[✓] Installed to $SCRIPT_PATH"
+            echo "[✓] You can now run 'lintspeed' from anywhere"
+        else
+            cp "$0" "$SCRIPT_PATH"
+            chmod +x "$SCRIPT_PATH"
+            echo "[✓] Installed to $SCRIPT_PATH"
+        fi
+    else
+        echo "[*] Skipping system-wide installation"
+        echo "[*] Run this script directly: ./$0"
+    fi
+    
+    echo ""
+    echo "[✓] Setup complete! Starting lintspeed..."
+    sleep 2
+fi
+
+python3 - <<'PYTHON_CODE'
+#!/usr/bin/env python3
+
+import curses
+import socket
+import time
+import threading
+import requests
+import statistics
+from datetime import datetime
+import struct
+import select
+
+class NetworkTester:
+    def __init__(self):
+        self.download_speed = 0
+        self.upload_speed = 0
+        self.ping = 0
+        self.jitter = 0
+        self.packet_loss = 0
+        self.server = "1.1.1.1"
+        self.testing = False
+        self.progress = 0
+        
+    def measure_ping(self, host, count=20):
+        pings = []
+        lost = 0
+        
+        for i in range(count):
+            try:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.settimeout(2)
+                start = time.time()
+                sock.connect((host, 80))
+                end = time.time()
+                sock.close()
+                pings.append((end - start) * 1000)
+            except:
+                lost += 1
+            self.progress = (i + 1) / count * 25
+        
+        if pings:
+            self.ping = statistics.mean(pings)
+            self.jitter = statistics.stdev(pings) if len(pings) > 1 else 0
+        self.packet_loss = (lost / count) * 100
+        
+    def measure_download(self):
+        test_urls = [
+            "http://speedtest.ftp.otenet.gr/files/test100k.db",
+            "http://speedtest.ftp.otenet.gr/files/test1Mb.db",
+            "http://speedtest.ftp.otenet.gr/files/test10Mb.db"
+        ]
+        
+        speeds = []
+        for idx, url in enumerate(test_urls):
+            try:
+                start = time.time()
+                response = requests.get(url, timeout=15, stream=True)
+                total_size = 0
+                for chunk in response.iter_content(chunk_size=8192):
+                    total_size += len(chunk)
+                end = time.time()
+                
+                duration = end - start
+                speed_mbps = (total_size * 8) / (duration * 1000000)
+                speeds.append(speed_mbps)
+                self.progress = 25 + ((idx + 1) / len(test_urls)) * 37.5
+            except:
+                pass
+        
+        if speeds:
+            self.download_speed = max(speeds)
+    
+    def measure_upload(self):
+        upload_url = "http://httpbin.org/post"
+        data_sizes = [1024 * 100, 1024 * 500, 1024 * 1000]
+        speeds = []
+        
+        for idx, size in enumerate(data_sizes):
+            try:
+                data = b'x' * size
+                start = time.time()
+                response = requests.post(upload_url, data=data, timeout=15)
+                end = time.time()
+                
+                duration = end - start
+                speed_mbps = (size * 8) / (duration * 1000000)
+                speeds.append(speed_mbps)
+                self.progress = 62.5 + ((idx + 1) / len(data_sizes)) * 37.5
+            except:
+                pass
+        
+        if speeds:
+            self.upload_speed = max(speeds)
+    
+    def run_test(self):
+        self.testing = True
+        self.progress = 0
+        self.measure_ping(self.server)
+        self.measure_download()
+        self.measure_upload()
+        self.progress = 100
+        self.testing = False
+
+def draw_box(stdscr, y, x, height, width, title=""):
+    for i in range(height):
+        stdscr.addstr(y + i, x, "│" + " " * (width - 2) + "│", curses.color_pair(1))
+    stdscr.addstr(y, x, "┌" + "─" * (width - 2) + "┐", curses.color_pair(1))
+    stdscr.addstr(y + height - 1, x, "└" + "─" * (width - 2) + "┘", curses.color_pair(1))
+    if title:
+        stdscr.addstr(y, x + 2, f" {title} ", curses.color_pair(3) | curses.A_BOLD)
+
+def draw_progress_bar(stdscr, y, x, width, progress):
+    filled = int((width - 2) * progress / 100)
+    bar = "█" * filled + "░" * (width - 2 - filled)
+    stdscr.addstr(y, x, f"[{bar}]", curses.color_pair(2))
+    stdscr.addstr(y, x + width + 2, f"{progress:.0f}%", curses.color_pair(2))
+
+def main(stdscr):
+    curses.curs_set(0)
+    curses.start_color()
+    curses.init_pair(1, curses.COLOR_CYAN, curses.COLOR_BLACK)
+    curses.init_pair(2, curses.COLOR_GREEN, curses.COLOR_BLACK)
+    curses.init_pair(3, curses.COLOR_YELLOW, curses.COLOR_BLACK)
+    curses.init_pair(4, curses.COLOR_MAGENTA, curses.COLOR_BLACK)
+    curses.init_pair(5, curses.COLOR_RED, curses.COLOR_BLACK)
+    
+    tester = NetworkTester()
+    
+    while True:
+        stdscr.clear()
+        height, width = stdscr.getmaxyx()
+        
+        title = "LINTSPEED v1.0"
+        author = "by 0xbv1 | 0xb0rn3"
+        stdscr.addstr(1, (width - len(title)) // 2, title, curses.color_pair(3) | curses.A_BOLD)
+        stdscr.addstr(2, (width - len(author)) // 2, author, curses.color_pair(1))
+        
+        draw_box(stdscr, 4, 2, 10, width - 4, "NETWORK STATISTICS")
+        
+        metrics = [
+            ("Download", f"{tester.download_speed:.2f} Mbps", 2),
+            ("Upload", f"{tester.upload_speed:.2f} Mbps", 2),
+            ("Ping", f"{tester.ping:.2f} ms", 2),
+            ("Jitter", f"{tester.jitter:.2f} ms", 2),
+            ("Packet Loss", f"{tester.packet_loss:.1f}%", 5 if tester.packet_loss > 5 else 2),
+        ]
+        
+        col1_x = 6
+        col2_x = width // 2 + 2
+        
+        for idx, (label, value, color) in enumerate(metrics):
+            row = 6 + (idx % 3) * 2
+            col_x = col1_x if idx < 3 else col2_x
+            stdscr.addstr(row, col_x, f"{label}:", curses.color_pair(4) | curses.A_BOLD)
+            stdscr.addstr(row, col_x + len(label) + 2, value, curses.color_pair(color) | curses.A_BOLD)
+        
+        if tester.testing:
+            draw_box(stdscr, 14, 2, 4, width - 4, "TEST PROGRESS")
+            draw_progress_bar(stdscr, 16, 4, width - 10, tester.progress)
+        
+        draw_box(stdscr, height - 6, 2, 4, width - 4, "CONTROLS")
+        stdscr.addstr(height - 4, 4, "[SPACE] Run Test  [Q] Quit  [R] Reset", curses.color_pair(1))
+        
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        stdscr.addstr(height - 1, 2, f"Server: {tester.server}", curses.color_pair(1))
+        stdscr.addstr(height - 1, width - len(timestamp) - 2, timestamp, curses.color_pair(1))
+        
+        stdscr.refresh()
+        stdscr.timeout(100)
+        
+        try:
+            key = stdscr.getch()
+            if key == ord('q') or key == ord('Q'):
+                break
+            elif (key == ord(' ') or key == ord('\n')) and not tester.testing:
+                test_thread = threading.Thread(target=tester.run_test)
+                test_thread.daemon = True
+                test_thread.start()
+            elif key == ord('r') or key == ord('R'):
+                tester.download_speed = 0
+                tester.upload_speed = 0
+                tester.ping = 0
+                tester.jitter = 0
+                tester.packet_loss = 0
+                tester.progress = 0
+        except:
+            pass
+
+if __name__ == "__main__":
+    try:
+        curses.wrapper(main)
+    except KeyboardInterrupt:
+        pass
+PYTHON_CODE
