@@ -108,15 +108,22 @@
 ### ⚡ Quick Start (Self-Compiling)
 
 ```bash
-# Clone repository
-git clone https://github.com/0xb0rn3/lintspeed.git
-cd lintspeed
+# Compile
+gcc -O3 -march=native -flto -pthread \
+    -o lintspeed-core core.c \
+    -lncurses -lpthread -lm -lrt
 
-# Make executable
-chmod +x lintspeed
+# For ICMP support (optional)
+sudo setcap cap_net_raw+ep ./lintspeed-core
 
-# Run (auto-compiles on first run)
-./lintspeed
+# Run
+./lintspeed-core
+
+# Or quick mode
+./lintspeed-core --quick
+
+# Custom server
+./lintspeed-core -s 8.8.8.8
 ```
 
 **First Run Wizard:**
