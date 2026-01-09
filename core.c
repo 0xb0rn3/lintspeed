@@ -19,12 +19,14 @@
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <sys/ioctl.h>
+#include <net/if.h>
 #include <netinet/in.h>
 #include <netinet/ip.h>
 #include <netinet/ip_icmp.h>
 #include <arpa/inet.h>
 #include <netdb.h>
-#include <termios.h>
+#include <linux/ethtool.h>
+#include <linux/sockios.h>
 #include <ncurses.h>
 
 #define VERSION "2.0.0"
@@ -42,16 +44,20 @@
 
 // Network test results
 typedef struct {
-    double download_speed;    // Mbps
-    double upload_speed;      // Mbps
-    double ping_avg;          // ms
-    double ping_min;          // ms
-    double ping_max;          // ms
-    double jitter;            // ms
-    double packet_loss;       // percentage
+    double download_speed;
+    double upload_speed;
+    double ping_avg;
+    double ping_min;
+    double ping_max;
+    double jitter;
+    double packet_loss;
     int samples_sent;
     int samples_received;
     char server[256];
+    char interface[64];
+    char interface_type[128];
+    char hardware[256];
+    int link_speed;
     time_t timestamp;
 } test_results_t;
 
@@ -101,6 +107,95 @@ uint16_t checksum(void *data, int len) {
     return ~sum;
 }
 
+// Get interface information
+void detect_interface(void) {
+    FILE *fp;
+    char line[256];
+    char iface[64] = "";
+    int max_speed = 0;
+    
+    // Find the active interface with highest speed
+    fp = popen("ip -o link show | grep 'state UP' | awk '{print $2}' | sed 's/://g'", "r");
+    if (!fp) return;
+    
+    while (fgets(line, sizeof(line), fp)) {
+        line[strcspn(line, "\n")] = 0;
+        if (strcmp(line, "lo") == 0) continue;
+        
+        char speed_path[256];
+        snprintf(speed_path, sizeof(speed_path), "/sys/class/net/%s/speed", line);
+        
+        FILE *sf = fopen(speed_path, "r");
+        if (sf) {
+            int speed;
+            if (fscanf(sf, "%d", &speed) == 1 && speed > max_speed) {
+                max_speed = speed;
+                strncpy(iface, line, sizeof(iface) - 1);
+            }
+            fclose(sf);
+        }
+    }
+    pclose(fp);
+    
+    if (iface[0]) {
+        pthread_mutex_lock(&state.lock);
+        strncpy(state.results.interface, iface, sizeof(state.results.interface) - 1);
+        state.results.link_speed = max_speed;
+        
+        // Determine interface type
+        if (strncmp(iface, "wl", 2) == 0) {
+            snprintf(state.results.interface_type, sizeof(state.results.interface_type), 
+                    "WiFi/WLAN");
+        } else if (max_speed == 1000) {
+            snprintf(state.results.interface_type, sizeof(state.results.interface_type),
+                    "Ethernet - Gigabit (Cat 5e/6/6a)");
+        } else if (max_speed == 10000) {
+            snprintf(state.results.interface_type, sizeof(state.results.interface_type),
+                    "Ethernet - 10 Gigabit (Cat 6a/7)");
+        } else if (max_speed == 100) {
+            snprintf(state.results.interface_type, sizeof(state.results.interface_type),
+                    "Ethernet - Fast Ethernet (Cat 5/5e)");
+        } else {
+            snprintf(state.results.interface_type, sizeof(state.results.interface_type),
+                    "Ethernet - %d Mbps", max_speed);
+        }
+        
+        // Get hardware info
+        char vendor_path[256], device_path[256];
+        snprintf(vendor_path, sizeof(vendor_path), "/sys/class/net/%s/device/vendor", iface);
+        snprintf(device_path, sizeof(device_path), "/sys/class/net/%s/device/device", iface);
+        
+        FILE *vf = fopen(vendor_path, "r");
+        FILE *df = fopen(device_path, "r");
+        
+        if (vf && df) {
+            char vendor[32], device[32];
+            if (fgets(vendor, sizeof(vendor), vf) && fgets(device, sizeof(device), df)) {
+                vendor[strcspn(vendor, "\n")] = 0;
+                device[strcspn(device, "\n")] = 0;
+                
+                char cmd[512];
+                snprintf(cmd, sizeof(cmd), 
+                        "lspci -d %s:%s 2>/dev/null | cut -d' ' -f2-",
+                        vendor + 2, device + 2);
+                
+                FILE *pci = popen(cmd, "r");
+                if (pci) {
+                    if (fgets(state.results.hardware, sizeof(state.results.hardware), pci)) {
+                        state.results.hardware[strcspn(state.results.hardware, "\n")] = 0;
+                    }
+                    pclose(pci);
+                }
+            }
+        }
+        
+        if (vf) fclose(vf);
+        if (df) fclose(df);
+        
+        pthread_mutex_unlock(&state.lock);
+    }
+}
+
 // ICMP ping measurement
 int icmp_ping(const char *host, double *rtt_ms) {
     int sock;
@@ -112,7 +207,7 @@ int icmp_ping(const char *host, double *rtt_ms) {
     
     sock = socket(AF_INET, SOCK_RAW, IPPROTO_ICMP);
     if (sock < 0) {
-        return -1; // Fall back to TCP
+        return -1;
     }
     
     struct timeval tv = {TIMEOUT_SEC, 0};
@@ -189,7 +284,7 @@ int tcp_ping(const char *host, int port, double *rtt_ms) {
     return 0;
 }
 
-// Ping measurement thread
+// Ping measurement
 void measure_ping(const char *host) {
     double samples[MAX_SAMPLES];
     int count = state.quick_mode ? 10 : 20;
@@ -207,7 +302,6 @@ void measure_ping(const char *host) {
         if (state.use_icmp) {
             ret = icmp_ping(host, &rtt);
             if (ret < 0) {
-                // Fall back to TCP
                 state.use_icmp = 0;
                 ret = tcp_ping(host, 80, &rtt);
             }
@@ -225,10 +319,9 @@ void measure_ping(const char *host) {
                 "Testing ping... %d/%d", i + 1, count);
         pthread_mutex_unlock(&state.lock);
         
-        usleep(50000); // 50ms between pings
+        usleep(50000);
     }
     
-    // Calculate statistics
     if (received > 0) {
         double sum = 0, sum_sq = 0;
         double min = samples[0], max = samples[0];
@@ -334,7 +427,7 @@ void measure_download(void) {
         host[host_len] = '\0';
         strcpy(path, pipe + 1);
         
-        char *response = malloc(20 * 1024 * 1024); // 20MB buffer
+        char *response = malloc(20 * 1024 * 1024);
         if (!response) continue;
         
         uint64_t start = get_usec();
@@ -357,7 +450,7 @@ void measure_download(void) {
 
 // Upload speed test
 void measure_upload(void) {
-    const size_t sizes[] = {102400, 512000, 1048576}; // 100KB, 500KB, 1MB
+    const size_t sizes[] = {102400, 512000, 1048576};
     int num_tests = state.quick_mode ? 2 : 3;
     double max_speed = 0;
     
@@ -368,7 +461,6 @@ void measure_upload(void) {
                 "Testing upload... %d/%d", i + 1, num_tests);
         pthread_mutex_unlock(&state.lock);
         
-        // Simplified upload test - create POST data
         char *data = malloc(sizes[i]);
         if (!data) continue;
         memset(data, 'x', sizes[i]);
@@ -423,6 +515,7 @@ void measure_upload(void) {
 void *test_thread(void *arg) {
     const char *server = (const char *)arg;
     
+    detect_interface();
     measure_ping(server);
     measure_download();
     measure_upload();
@@ -471,7 +564,24 @@ void draw_ui(void) {
     attroff(COLOR_PAIR(COLOR_HEADER) | A_BOLD);
     row++;
     
-    // Statistics section
+    pthread_mutex_lock(&state.lock);
+    
+    // Hardware info
+    if (state.results.interface[0]) {
+        attron(COLOR_PAIR(COLOR_INFO));
+        mvprintw(row++, 2, "Interface: %s (%s)", 
+                state.results.interface, state.results.interface_type);
+        if (state.results.hardware[0]) {
+            mvprintw(row++, 2, "Hardware: %s", state.results.hardware);
+        }
+        if (state.results.link_speed > 0) {
+            mvprintw(row++, 2, "Link Speed: %d Mbps", state.results.link_speed);
+        }
+        attroff(COLOR_PAIR(COLOR_INFO));
+        row++;
+    }
+    
+    // Statistics
     attron(A_BOLD);
     for (int i = 0; i < cols; i++) mvaddch(row, i, '-');
     row++;
@@ -479,8 +589,6 @@ void draw_ui(void) {
     for (int i = 0; i < cols; i++) mvaddch(row++, i, '-');
     attroff(A_BOLD);
     row++;
-    
-    pthread_mutex_lock(&state.lock);
     
     attron(COLOR_PAIR(COLOR_SUCCESS));
     mvprintw(row++, 2, "Download Speed:    %.2f Mbps", state.results.download_speed);
@@ -495,16 +603,16 @@ void draw_ui(void) {
     
     if (state.results.packet_loss > 5.0) {
         attron(COLOR_PAIR(COLOR_WARNING) | A_BOLD);
-        mvprintw(row++, 2, "Packet Loss:       %.1f%% ⚠", state.results.packet_loss);
+        mvprintw(row++, 2, "Packet Loss:       %.1f%% [!]", state.results.packet_loss);
         attroff(COLOR_PAIR(COLOR_WARNING) | A_BOLD);
     } else {
         attron(COLOR_PAIR(COLOR_SUCCESS));
-        mvprintw(row++, 2, "Packet Loss:       %.1f%% ✓", state.results.packet_loss);
+        mvprintw(row++, 2, "Packet Loss:       %.1f%% [OK]", state.results.packet_loss);
         attroff(COLOR_PAIR(COLOR_SUCCESS));
     }
     row++;
     
-    // Progress bar if testing
+    // Progress bar
     if (state.testing) {
         for (int i = 0; i < cols; i++) mvaddch(row, i, '-');
         row++;
@@ -553,12 +661,12 @@ void draw_ui(void) {
     row++;
     
     char footer[256];
-    time_t now = time(NULL);
-    struct tm *tm_info = localtime(&now);
     snprintf(footer, sizeof(footer), "Server: %s", state.results.server);
     mvprintw(row, 2, "%s", footer);
     
     char timestamp[64];
+    time_t now = time(NULL);
+    struct tm *tm_info = localtime(&now);
     strftime(timestamp, sizeof(timestamp), "%Y-%m-%d %H:%M:%S", tm_info);
     mvprintw(row, cols - strlen(timestamp) - 2, "%s", timestamp);
     
@@ -567,16 +675,13 @@ void draw_ui(void) {
 
 // Main function
 int main(int argc, char **argv) {
-    // Initialize state
     memset(&state, 0, sizeof(state));
     pthread_mutex_init(&state.lock, NULL);
     strcpy(state.results.server, DEFAULT_SERVER);
     snprintf(state.status, sizeof(state.status), "Ready");
     
-    // Check for ICMP capability
     state.use_icmp = (getenv("LINTSPEED_NO_ICMP") == NULL);
     
-    // Parse args
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-q") == 0 || strcmp(argv[i], "--quick") == 0) {
             state.quick_mode = 1;
@@ -585,16 +690,13 @@ int main(int argc, char **argv) {
         }
     }
     
-    // Setup signal handlers
     signal(SIGINT, handle_signal);
     signal(SIGTERM, handle_signal);
     
-    // Initialize UI
     init_ui();
     
     pthread_t thread;
     
-    // Main loop
     while (running) {
         draw_ui();
         
@@ -612,10 +714,9 @@ int main(int argc, char **argv) {
             strcpy(state.results.server, DEFAULT_SERVER);
         }
         
-        usleep(100000); // 100ms refresh
+        usleep(100000);
     }
     
-    // Cleanup
     endwin();
     pthread_mutex_destroy(&state.lock);
     
