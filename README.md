@@ -23,7 +23,9 @@
 
 ** 🎯 Hardware-Level Performance • 🔥 Zero External Dependencies**
 
-curl -fsSL https://raw.githubusercontent.com/0xb0rn3/lintspeed/main/run | sudo bash
+## curl -fsSL https://raw.githubusercontent.com/0xb0rn3/lintspeed/main/run | sudo bash
+
+
 **[Documentation](https://github.com/0xb0rn3/lintspeed/wiki)** • 
 **[Issues](https://github.com/0xb0rn3/lintspeed/issues)** • 
 **[Releases](https://github.com/0xb0rn3/lintspeed/releases)** •
