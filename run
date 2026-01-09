@@ -1,0 +1,300 @@
+#!/bin/bash
+# Network Speed Testing Tool - Shell + C Integration
+# Tests all network interfaces with hardware-level precision
+
+set -e
+
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m'
+
+# Create temporary C program for hardware-level measurements
+cat > /tmp/net_speed_test.c << 'CCODE'
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <sys/socket.h>
+#include <sys/ioctl.h>
+#include <net/if.h>
+#include <linux/ethtool.h>
+#include <linux/sockios.h>
+#include <linux/wireless.h>
+#include <time.h>
+#include <errno.h>
+
+typedef struct {
+    char name[IFNAMSIZ];
+    int speed;
+    int duplex;
+    char link_mode[32];
+    int is_wireless;
+    char wireless_mode[64];
+} iface_info;
+
+int get_ethtool_link_speed(const char *ifname, iface_info *info) {
+    int sock = socket(AF_INET, SOCK_DGRAM, 0);
+    if (sock < 0) return -1;
+    
+    struct ifreq ifr;
+    struct ethtool_cmd edata;
+    
+    memset(&ifr, 0, sizeof(ifr));
+    strncpy(ifr.ifr_name, ifname, IFNAMSIZ - 1);
+    
+    edata.cmd = ETHTOOL_GSET;
+    ifr.ifr_data = (char *)&edata;
+    
+    if (ioctl(sock, SIOCETHTOOL, &ifr) < 0) {
+        close(sock);
+        return -1;
+    }
+    
+    info->speed = ethtool_cmd_speed(&edata);
+    info->duplex = edata.duplex;
+    
+    if (edata.duplex == DUPLEX_FULL)
+        strcpy(info->link_mode, "Full-Duplex");
+    else if (edata.duplex == DUPLEX_HALF)
+        strcpy(info->link_mode, "Half-Duplex");
+    else
+        strcpy(info->link_mode, "Unknown");
+    
+    close(sock);
+    return 0;
+}
+
+int check_wireless(const char *ifname, iface_info *info) {
+    int sock = socket(AF_INET, SOCK_DGRAM, 0);
+    if (sock < 0) return 0;
+    
+    struct iwreq wrq;
+    memset(&wrq, 0, sizeof(wrq));
+    strncpy(wrq.ifr_name, ifname, IFNAMSIZ - 1);
+    
+    if (ioctl(sock, SIOCGIWNAME, &wrq) >= 0) {
+        info->is_wireless = 1;
+        strncpy(info->wireless_mode, wrq.u.name, sizeof(info->wireless_mode) - 1);
+        close(sock);
+        return 1;
+    }
+    
+    close(sock);
+    return 0;
+}
+
+void measure_interface_bandwidth(const char *ifname) {
+    char stat_path[256];
+    snprintf(stat_path, sizeof(stat_path), "/sys/class/net/%s/statistics/rx_bytes", ifname);
+    
+    FILE *f1 = fopen(stat_path, "r");
+    if (!f1) return;
+    
+    unsigned long long rx_start, rx_end;
+    fscanf(f1, "%llu", &rx_start);
+    fclose(f1);
+    
+    snprintf(stat_path, sizeof(stat_path), "/sys/class/net/%s/statistics/tx_bytes", ifname);
+    FILE *f2 = fopen(stat_path, "r");
+    if (!f2) return;
+    
+    unsigned long long tx_start, tx_end;
+    fscanf(f2, "%llu", &tx_start);
+    fclose(f2);
+    
+    sleep(1);
+    
+    snprintf(stat_path, sizeof(stat_path), "/sys/class/net/%s/statistics/rx_bytes", ifname);
+    f1 = fopen(stat_path, "r");
+    if (f1) {
+        fscanf(f1, "%llu", &rx_end);
+        fclose(f1);
+    }
+    
+    snprintf(stat_path, sizeof(stat_path), "/sys/class/net/%s/statistics/tx_bytes", ifname);
+    f2 = fopen(stat_path, "r");
+    if (f2) {
+        fscanf(f2, "%llu", &tx_end);
+        fclose(f2);
+    }
+    
+    double rx_rate = (rx_end - rx_start) * 8.0 / 1000000.0;
+    double tx_rate = (tx_end - tx_start) * 8.0 / 1000000.0;
+    
+    printf("CURRENT_RX:%.2f\n", rx_rate);
+    printf("CURRENT_TX:%.2f\n", tx_rate);
+}
+
+int main(int argc, char *argv[]) {
+    if (argc < 2) {
+        fprintf(stderr, "Usage: %s <interface>\n", argv[0]);
+        return 1;
+    }
+    
+    const char *ifname = argv[1];
+    iface_info info;
+    memset(&info, 0, sizeof(info));
+    strncpy(info.name, ifname, IFNAMSIZ - 1);
+    
+    if (check_wireless(ifname, &info)) {
+        printf("TYPE:Wireless\n");
+        printf("WIRELESS_PROTOCOL:%s\n", info.wireless_mode);
+    } else {
+        printf("TYPE:Ethernet\n");
+        
+        if (get_ethtool_link_speed(ifname, &info) == 0) {
+            printf("LINK_SPEED:%d\n", info.speed);
+            printf("LINK_MODE:%s\n", info.link_mode);
+        }
+    }
+    
+    measure_interface_bandwidth(ifname);
+    
+    return 0;
+}
+CCODE
+
+# Compile C code
+gcc -o /tmp/net_speed_test /tmp/net_speed_test.c 2>/dev/null || {
+    echo -e "${RED}[!] Failed to compile C code. Install gcc.${NC}"
+    exit 1
+}
+
+echo -e "${BLUE}╔═══════════════════════════════════════════════════════════╗${NC}"
+echo -e "${BLUE}║       Network Interface Speed Testing Tool               ║${NC}"
+echo -e "${BLUE}╚═══════════════════════════════════════════════════════════╝${NC}"
+echo ""
+
+# Function to detect cable category
+detect_cable_type() {
+    local speed=$1
+    case $speed in
+        10) echo "Cat3 (10BASE-T)" ;;
+        100) echo "Cat5/Cat5e (100BASE-TX)" ;;
+        1000) echo "Cat5e/Cat6 (1000BASE-T)" ;;
+        2500) echo "Cat5e/Cat6 (2.5GBASE-T)" ;;
+        5000) echo "Cat6/Cat6a (5GBASE-T)" ;;
+        10000) echo "Cat6a/Cat7 (10GBASE-T)" ;;
+        *) echo "Unknown" ;;
+    esac
+}
+
+# Function to get hardware info
+get_hardware_info() {
+    local iface=$1
+    
+    # Try to get driver info
+    if [ -e "/sys/class/net/$iface/device/modalias" ]; then
+        local modalias=$(cat /sys/class/net/$iface/device/modalias 2>/dev/null)
+        echo "$modalias"
+    fi
+    
+    # Get vendor and device
+    if [ -e "/sys/class/net/$iface/device/vendor" ] && [ -e "/sys/class/net/$iface/device/device" ]; then
+        local vendor=$(cat /sys/class/net/$iface/device/vendor 2>/dev/null)
+        local device=$(cat /sys/class/net/$iface/device/device 2>/dev/null)
+        
+        # Try to match against PCI database
+        if command -v lspci &> /dev/null; then
+            lspci -d "${vendor#0x}:${device#0x}" 2>/dev/null | head -1
+        fi
+    fi
+}
+
+# Get all network interfaces (excluding loopback)
+interfaces=$(ip -o link show | awk -F': ' '{print $2}' | grep -v '^lo$')
+
+for iface in $interfaces; do
+    echo -e "${GREEN}═══════════════════════════════════════════════════════════${NC}"
+    echo -e "${GREEN}Interface: $iface${NC}"
+    echo -e "${GREEN}═══════════════════════════════════════════════════════════${NC}"
+    
+    # Check if interface is up
+    if ! ip link show $iface | grep -q "state UP"; then
+        echo -e "${YELLOW}[!] Interface is DOWN${NC}"
+        echo ""
+        continue
+    fi
+    
+    # Run C program for hardware-level measurements
+    c_output=$(/tmp/net_speed_test $iface 2>/dev/null)
+    
+    # Parse C output
+    iface_type=$(echo "$c_output" | grep "^TYPE:" | cut -d: -f2)
+    link_speed=$(echo "$c_output" | grep "^LINK_SPEED:" | cut -d: -f2)
+    link_mode=$(echo "$c_output" | grep "^LINK_MODE:" | cut -d: -f2)
+    wireless_proto=$(echo "$c_output" | grep "^WIRELESS_PROTOCOL:" | cut -d: -f2)
+    current_rx=$(echo "$c_output" | grep "^CURRENT_RX:" | cut -d: -f2)
+    current_tx=$(echo "$c_output" | grep "^CURRENT_TX:" | cut -d: -f2)
+    
+    echo -e "${BLUE}[*] Interface Type:${NC} $iface_type"
+    
+    if [ "$iface_type" = "Wireless" ]; then
+        echo -e "${BLUE}[*] Wireless Protocol:${NC} $wireless_proto"
+        
+        # Get additional wireless info
+        if command -v iwconfig &> /dev/null; then
+            bitrate=$(iwconfig $iface 2>/dev/null | grep "Bit Rate" | awk -F'=' '{print $2}' | awk '{print $1 " " $2}')
+            [ -n "$bitrate" ] && echo -e "${BLUE}[*] Current Bit Rate:${NC} $bitrate"
+        fi
+        
+        # Get wireless chipset
+        if command -v lspci &> /dev/null; then
+            wireless_hw=$(lspci | grep -i "wireless\|network" | grep -i "$(get_hardware_info $iface | cut -d: -f1)" | head -1)
+            [ -n "$wireless_hw" ] && echo -e "${BLUE}[*] Hardware:${NC} $wireless_hw"
+        fi
+    else
+        if [ -n "$link_speed" ] && [ "$link_speed" != "0" ] && [ "$link_speed" != "65535" ]; then
+            echo -e "${BLUE}[*] Link Speed:${NC} ${link_speed} Mbps"
+            echo -e "${BLUE}[*] Link Mode:${NC} $link_mode"
+            
+            cable_type=$(detect_cable_type $link_speed)
+            echo -e "${BLUE}[*] Cable Type:${NC} $cable_type"
+        fi
+        
+        # Get Ethernet hardware info
+        hw_info=$(get_hardware_info $iface)
+        [ -n "$hw_info" ] && echo -e "${BLUE}[*] Hardware:${NC} $hw_info"
+    fi
+    
+    # Current traffic
+    if [ -n "$current_rx" ]; then
+        echo -e "${YELLOW}[*] Current RX:${NC} ${current_rx} Mbps"
+        echo -e "${YELLOW}[*] Current TX:${NC} ${current_tx} Mbps"
+    fi
+    
+    # Get IP address
+    ipaddr=$(ip addr show $iface | grep "inet " | awk '{print $2}' | head -1)
+    [ -n "$ipaddr" ] && echo -e "${BLUE}[*] IP Address:${NC} $ipaddr"
+    
+    # Internet speed test (optional, only for active connection)
+    if [ -n "$ipaddr" ]; then
+        echo -e "${YELLOW}[*] Testing internet speed (this may take a few seconds)...${NC}"
+        
+        # Quick ping test for latency
+        if ping -c 3 -W 2 8.8.8.8 &>/dev/null; then
+            latency=$(ping -c 3 8.8.8.8 2>/dev/null | tail -1 | awk -F'/' '{print $5}')
+            [ -n "$latency" ] && echo -e "${BLUE}[*] Latency:${NC} ${latency} ms"
+            
+            # Simple download speed test using curl
+            if command -v curl &> /dev/null; then
+                test_url="http://speedtest.tele2.net/1MB.zip"
+                download_speed=$(curl -o /dev/null -s -w '%{speed_download}' --max-time 10 $test_url 2>/dev/null)
+                if [ -n "$download_speed" ]; then
+                    download_mbps=$(echo "scale=2; $download_speed * 8 / 1000000" | bc 2>/dev/null || echo "N/A")
+                    echo -e "${BLUE}[*] Internet Download:${NC} ${download_mbps} Mbps (approx)"
+                fi
+            fi
+        fi
+    fi
+    
+    echo ""
+done
+
+# Cleanup
+rm -f /tmp/net_speed_test /tmp/net_speed_test.c
+
+echo -e "${GREEN}[✓] Network speed testing complete${NC}"
